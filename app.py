@@ -1,40 +1,27 @@
 import os
+import io
 import pandas as pd
 import streamlit as st
 
 from azure.identity import DefaultAzureCredential
-from deltalake import DeltaTable
-import pyarrow.dataset as ds
+from azure.storage.blob import BlobServiceClient
 
 st.set_page_config(page_title="BTC Signals & KPIs", layout="wide")
 
 # --------- CONFIG ----------
 STORAGE_ACCOUNT = os.getenv("STORAGE_ACCOUNT", "stfinancedl13131")
-
-# delta-rs azure path: az://<container>/<path>
-
-PRED_DELTA_PATH = os.getenv(
-    "PRED_DELTA_PATH",
-    "az://datalake/btc/predictions/predictions_5m_nodv"
-)
-
+CONTAINER = "datalake"
+PARQUET_PREFIX = "btc/predictions/predictions_5m_nodv/"
 
 PROBA_BUY = float(os.getenv("PROBA_BUY", "0.60"))
 PROBA_SELL = float(os.getenv("PROBA_SELL", "0.40"))
 N_ROWS = int(os.getenv("N_ROWS", "2000"))
-
-# Optional: limit scan window (reduces work). Set in Azure App Settings if you want.
-# Example: LOOKBACK_HOURS=48
 LOOKBACK_HOURS = int(os.getenv("LOOKBACK_HOURS", "0"))
 
 # --------- AUTH (Managed Identity) ----------
 @st.cache_resource
 def get_credential():
     return DefaultAzureCredential()
-
-def get_storage_token() -> str:
-    cred = get_credential()
-    return cred.get_token("https://storage.azure.com/.default").token
 
 def signal_from_proba(p: float) -> str:
     if p >= PROBA_BUY:
@@ -43,71 +30,71 @@ def signal_from_proba(p: float) -> str:
         return "🔴 SELL"
     return "🟡 HOLD"
 
-# --------- MEMORY-SAFE DELTA READ ----------
+# --------- DIRECT PARQUET READ (bypassing Delta) ----------
 @st.cache_data(ttl=30)
 def load_predictions_batched() -> pd.DataFrame:
     """
-    Read Delta table in batches, keep only the latest N rows by event_time_ts.
-    This avoids loading the full table into memory (dt.to_pandas()).
+    Read parquet files directly (bypassing Delta due to path mismatch in Delta log)
     """
-    token = get_storage_token()
-
-    dt = DeltaTable(
-        PRED_DELTA_PATH,
-        storage_options={
-            "account_name": STORAGE_ACCOUNT,
-            "token": token,
-        }
+    cred = get_credential()
+    
+    blob_service = BlobServiceClient(
+        account_url=f"https://{STORAGE_ACCOUNT}.blob.core.windows.net",
+        credential=cred
     )
-
-    dataset = dt.to_pyarrow_dataset()
-
-    # Columns we want (only keep those that exist)
-    wanted = ["symbol", "interval", "event_time_ts", "proba_up", "pred_up", "model_run_id", "scoring_time"]
-    existing = [c for c in wanted if c in dataset.schema.names]
-
-    if "event_time_ts" not in existing:
-        # If your table uses a different timestamp column, change it here.
-        raise ValueError(
-            "Column 'event_time_ts' not found in Delta table. "
-            f"Available columns: {dataset.schema.names}"
-        )
-
-    # Optional filter: only last X hours (works if event_time_ts is a timestamp column)
-    arrow_filter = None
+    
+    container = blob_service.get_container_client(CONTAINER)
+    
+    # Get all parquet files
+    blobs = list(container.list_blobs(name_starts_with=PARQUET_PREFIX))
+    parquet_files = [b for b in blobs if b.name.endswith('.parquet') and '_delta_log' not in b.name]
+    
+    if not parquet_files:
+        raise ValueError(f"No parquet files found at {PARQUET_PREFIX}")
+    
+    # Sort by last modified, get recent files
+    parquet_files.sort(key=lambda x: x.last_modified, reverse=True)
+    
+    # Read files (limit to avoid memory issues)
+    dfs = []
+    max_files = 50 if LOOKBACK_HOURS == 0 else 100  # Read more files if filtering by time
+    
+    for blob in parquet_files[:max_files]:
+        try:
+            blob_client = container.get_blob_client(blob.name)
+            stream = blob_client.download_blob()
+            df_chunk = pd.read_parquet(io.BytesIO(stream.readall()))
+            dfs.append(df_chunk)
+        except Exception as e:
+            # Skip problematic files
+            continue
+    
+    if not dfs:
+        raise ValueError("Could not read any parquet files")
+    
+    pdf = pd.concat(dfs, ignore_index=True)
+    
+    # Process timestamps
+    for c in ["event_time_ts", "scoring_time"]:
+        if c in pdf.columns:
+            pdf[c] = pd.to_datetime(pdf[c], errors="coerce", utc=True)
+    
+    pdf = pdf.dropna(subset=["event_time_ts"])
+    
+    # Apply lookback filter if set
     if LOOKBACK_HOURS > 0:
         cutoff = pd.Timestamp.utcnow().tz_localize("UTC") - pd.Timedelta(hours=LOOKBACK_HOURS)
-        try:
-            arrow_filter = ds.field("event_time_ts") >= cutoff
-        except Exception:
-            arrow_filter = None  # if type mismatch, skip filter
-
-    # Scan in batches (bounded memory)
-    scanner = dataset.scanner(columns=existing, filter=arrow_filter)
-
-    keep = pd.DataFrame(columns=existing)
-    for rb in scanner.to_batches():
-        chunk = rb.to_pandas()
-
-        # Normalize timestamps safely
-        for c in ["event_time_ts", "scoring_time"]:
-            if c in chunk.columns:
-                chunk[c] = pd.to_datetime(chunk[c], errors="coerce", utc=True)
-
-        chunk = chunk.dropna(subset=["event_time_ts"])
-        if chunk.empty:
-            continue
-
-        # Append then keep only top N by latest event_time_ts
-        keep = pd.concat([keep, chunk], ignore_index=True)
-        keep = keep.sort_values("event_time_ts", ascending=False).head(N_ROWS)
-
-    return keep.reset_index(drop=True)
+        pdf = pdf[pdf["event_time_ts"] >= cutoff]
+    
+    # Keep only latest N rows
+    pdf = pdf.sort_values("event_time_ts", ascending=False).head(N_ROWS)
+    
+    return pdf.reset_index(drop=True)
 
 # --------- UI ----------
-st.title("📈 BTCUSDT – Signals & KPIs (from Delta Lake)")
+st.title("📈 BTCUSDT – Signals & KPIs (from Parquet files)")
 
-st.caption(f"Delta path: {PRED_DELTA_PATH}")
+st.caption(f"Reading from: {STORAGE_ACCOUNT}/{PARQUET_PREFIX}")
 
 # Load button (prevents crash loops and lets you see real errors)
 if "loaded" not in st.session_state:
@@ -120,32 +107,32 @@ with colA:
 
 with colB:
     st.info(
-        "Tip: If it’s still slow, set LOOKBACK_HOURS (e.g., 24 or 48) in Azure App Settings "
-        "to reduce scanning."
+        "Reading parquet files directly. Set LOOKBACK_HOURS (e.g., 24 or 48) in Azure App Settings "
+        "to reduce data loaded."
     )
 
 if not st.session_state.loaded:
     st.stop()
 
-with st.spinner("Reading Delta table..."):
+with st.spinner("Reading parquet files..."):
     try:
         pdf = load_predictions_batched()
     except Exception as e:
-        st.error("App started, but reading Delta Lake failed.")
+        st.error("App started, but reading parquet files failed.")
         st.exception(e)
         st.markdown(
             """
 **Common fixes**
 - Enable Web App **Identity** (System assigned = ON)
 - Give it **Storage Blob Data Reader** on the Storage Account / Container
-- Verify `STORAGE_ACCOUNT` and `PRED_DELTA_PATH`
-- If the table is huge, set `LOOKBACK_HOURS=48` (or smaller)
+- Verify `STORAGE_ACCOUNT` is correct
+- Check that parquet files exist at the path
             """
         )
         st.stop()
 
 if pdf.empty:
-    st.warning("No predictions returned. Check the Delta path/job and (optional) LOOKBACK_HOURS.")
+    st.warning("No predictions returned. Check the parquet files and (optional) LOOKBACK_HOURS.")
     st.stop()
 
 latest = pdf.iloc[0]
@@ -184,4 +171,3 @@ with right:
 st.divider()
 st.subheader("Dernières lignes")
 st.dataframe(pdf.head(50), use_container_width=True)
-
