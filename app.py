@@ -12,10 +12,12 @@ st.set_page_config(page_title="BTC Signals & KPIs", layout="wide")
 STORAGE_ACCOUNT = os.getenv("STORAGE_ACCOUNT", "stfinancedl13131")
 
 # delta-rs azure path: az://<container>/<path>
+
 PRED_DELTA_PATH = os.getenv(
     "PRED_DELTA_PATH",
-    "az://datalake/btc/predictions/predictions_5m"
+    "az://datalake/btc/predictions/predictions_5m_nodv"
 )
+
 
 PROBA_BUY = float(os.getenv("PROBA_BUY", "0.60"))
 PROBA_SELL = float(os.getenv("PROBA_SELL", "0.40"))
@@ -182,3 +184,4 @@ with right:
 st.divider()
 st.subheader("Dernières lignes")
 st.dataframe(pdf.head(50), use_container_width=True)
+
